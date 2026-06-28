@@ -1,0 +1,12 @@
+name: neural_data_science_project
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - jupyter
+  - scipy
