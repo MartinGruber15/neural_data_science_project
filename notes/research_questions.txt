@@ -14,3 +14,27 @@ Topic: Neural Coding
   - Look at the explained variance between sessions, with the hyophesis that for natural scences, as the mouse is more excited and runs, we would get to explain more variance using the running speed
   - Use session abt locally sparse noise as baseline / ISI between stimuli as baseline for explained variance
 
+
+** Man-Shan ideas: **
+Main Question: Does the visual cortex also exhibit the sensory gating effect?
+Sensory gating (SG) is a neural mechanism that attenuates sensory responses during the preparation and execution of movement. Within this framework, I aim to address two questions:
+1. Does neural activity decrease while the mouse is moving, as the SG effect would predict?
+1.1. Compare neural activity between moving and non-moving states.
+1.2. Further dissect movement into three kinematic phases — speeding up, stable speed, and slowing down — and test whether neural activity differs across them. Does the speed-up phase show the greatest attenuation, or not?
+2. Does the SG effect vary across different contexts?
+2.1. Compare overall movement across sessions A, B, and C. (I expect session C to involve more movement, as it is the most naturalistic.)
+2.2. Categorize the images in session C as "aversive or threatening" (e.g., a predator), "neutral" (e.g., a mountain view), or "rewarding" (e.g., food), and compare movement across these categories. (I’m not sure if the mouse could really sense the different pictures)
+2.3. Within session C, if movement differs between categories, examine whether neural activity differs as well.
+For example, there may be greater attenuation when the mouse views threatening images, because it is preoccupied with escaping the threat. Or, neural activity may increase when viewing these images, because the mouse is more focused and attentive.
+Some papers about the visual cortex
+Locomotion-induced gain of visual responses cannot explain visuomotor mismatch responses in layer 2/3 of primary visual cortex https://pubmed.ncbi.nlm.nih.gov/36821437/
+
+Cholinergic input to mouse visual cortex signals a movement state and acutely enhances layer 5 responsiveness https://elifesciences.org/articles/89986
+
+Movement and Performance Explain Widespread Cortical Activity in a Visual Detection Task
+https://pmc.ncbi.nlm.nih.gov/articles/PMC7029483/
+
+Spontaneous behaviors drive multidimensional, brainwide activity
+https://www.science.org/doi/10.1126/science.aav7893
+
+
