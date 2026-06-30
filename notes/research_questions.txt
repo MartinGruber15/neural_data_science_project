@@ -1,0 +1,16 @@
+Names: Andre Pfrommer, Man-Shan Chang, Martin Gruber
+Topic: Neural Coding
+
+
+**Andres ideas:**
+- Does running speed act as a top-down modulation of neural tuning of visual cortex neurons?
+- Does it increase or decrease firing rate of neurons? 
+- Can it explain noise correlation between different neurons as a latent state? 
+  - Idea: Per session, train GPFA model to infer a latent state x(t) to the spike counts y(t) for each neuron like in Ecker et al. (2014), https://www.sciencedirect.com/science/article/pii/S0896627314001044?via%3Dihub
+  - Then look at the whether latent mean trace corresponds to the running speed over time 
+  - Maybe also look at the inferred parameter dist of the GPFA model. 
+    - Compare strength of weights $C_n$ during high activity and low running activity
+    - Compare time constants $\tau$ during high activity and low running activity
+  - Look at the explained variance between sessions, with the hyophesis that for natural scences, as the mouse is more excited and runs, we would get to explain more variance using the running speed
+  - Use session abt locally sparse noise as baseline / ISI between stimuli as baseline for explained variance
+
