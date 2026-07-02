@@ -32,3 +32,10 @@ Spontaneous behaviors drive multidimensional, brainwide activity
 https://www.science.org/doi/10.1126/science.aav7893
 
 
+
+TODOs:
+- Smooth / low pass filtering running trace
+- Train LNP model to neural spikes with running speed 
+- Look at three kinematic phases for moving grating session
+  - Pick neuron with highest rate (tuned to some orientation)
+- Fit tuning curve to each cell / differentiate into simple/complex cells
