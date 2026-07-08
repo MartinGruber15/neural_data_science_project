@@ -56,3 +56,19 @@ def save_data(data, filename):
 def load_saved_data(filename):
     with open("../data/" + filename, "rb") as f:
         return pickle.load(f)
+
+def cov_anal(fit) -> np.ndarray:
+    """
+    Analytical mean and covariance of the log-normal Cox process approximation
+    to the fitted Poisson-GPFA model (Krumin & Shoham, 2009).
+    """
+    C = fit.optimParams["C"] # shape (n_neurons, latent_dim)
+    d = fit.optimParams["d"] # shape (n_neurons,)
+    
+    # mu of log-normal Cox process approximation
+    mu = np.exp(0.5 * np.sum(C**2, axis=1) + d) # shape (n_neurons,)
+    
+    # covariance of log-normal Cox process approximation
+    cov = np.outer(mu, mu) * (np.exp(C @ C.T) -  1) + np.diag(mu) # shape (n_neurons, n_neurons)
+    
+    return cov, mu
