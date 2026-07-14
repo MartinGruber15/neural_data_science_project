@@ -3,6 +3,7 @@ import pandas as pd
 from pathlib import Path
 import pickle
 from scipy import optimize as opt
+import matplotlib.pyplot as plt
 
 # load the data
 def load_data(path="../data"):
@@ -132,16 +133,341 @@ def testTuning(
 
     return p_value, q_abs, qs_abs_shuffled
 
+
+# ------------------ GPFA utils -----------------------------------
+class GPFADataset:
+    """
+    Create a GPFA-compatible dataset restricted to trials matching one or
+    more stimulus conditions (parameter/value pairs), further restricted to
+    time bins matching a given running phase.
+
+    Every trial is truncated to exactly `minimum_nr_of_bins` qualifying bins,
+    so all trials in the dataset have the same fixed length (self.T).
+    Trials with fewer than `minimum_nr_of_bins` matching bins are dropped.
+    """
+
+    def __init__(
+        self,
+        data=None,
+        session_id="B",
+        stimulus="natural_scenes",
+        parameters=["orientation", "temporal_frequency"],
+        parameter_values=[0, 1],
+        minimum_nr_of_bins=10,
+        running_phase_value=None,
+    ):
+        session = data["sessions"][session_id]
+        spikes = np.asarray(session["spikes"], dtype=float)
+        t = np.asarray(session["t"], dtype=float)
+        stim_table = session["stim_tables"][stimulus].copy()
+        running_speed = np.asarray(session["running_speed_filtered"][0], dtype=float)
+        running_phase = np.asarray(session["running_speed_phase"], dtype=int)
+
+        for parameter, parameter_value in zip(parameters, parameter_values):
+            stim_table = stim_table[stim_table[parameter] == parameter_value].reset_index(drop=True)
+
+        dt_sec = float(np.median(np.diff(t)))
+        dt_ms = dt_sec * 1000.0
+
+        T = int(minimum_nr_of_bins)
+        T -= T % 2  # keep even
+        if T < 1:
+            raise ValueError("minimum_nr_of_bins must be >= 2 (kept even).")
+
+        self.binSize = dt_ms
+        self.ydim = spikes.shape[0]
+        self.session_id = session_id
+        self.stimulus = stimulus
+        self.parameters = parameters
+        self.parameter_values = parameter_values
+        self.running_phase_value = running_phase_value
+        self.T = T
+
+        if stim_table.empty:
+            self.data, self.trial_durs, self.trialDur, self.numTrials = [], [], 0, 0
+            return
+
+        max_start = min(spikes.shape[1], running_speed.shape[0])
+
+        trials = []
+        for _, row in stim_table.iterrows():
+            start = int(row["start"])
+            stop = min(int(row["end"]), max_start)
+            if stop <= start:
+                continue
+
+            Y = spikes[:, start:stop].clip(min=0.0)
+            speed = running_speed[start:stop]
+            phase = running_phase[start:stop]
+
+            if running_phase_value is not None:
+                mask = phase == int(running_phase_value)
+                if mask.sum() < T:
+                    continue
+                Y = Y[:, mask]
+                speed = speed[mask]
+                phase = phase[mask]
+
+            if Y.shape[1] < T:
+                continue
+
+            trials.append({
+                "Y": Y[:, :T].copy(),
+                "start_idx": start,
+                "end_idx": stop,
+                "running_speed": speed[:T].copy(), 
+            })
+
+        if not trials:
+            raise ValueError(
+                f"No trials had at least {T} bins matching running_phase_value={running_phase_value}."
+            )
+
+        self.data = trials
+        self.trial_durs = [T * dt_ms] * len(trials)
+        self.trialDur = T * dt_ms
+        self.numTrials = len(trials)
+
 def cov_anal(fit):
-    """Analytical mean and covariance of the log-normal Cox process approximation to the fitted Poisson-GPFA model (Krumin & Shoham, 2009).
+    """
+    Analytical mean and covariance of the log-normal Cox process 
+    approximation to the fitted Poisson-GPFA model (Krumin & Shoham, 2009).
     """
     C = fit.optimParams["C"] # shape (n_neurons, latent_dim)
     d = fit.optimParams["d"] # shape (n_neurons,)
-    
-    # mu of log-normal Cox process approximation
-    mu = np.exp(0.5 * np.sum(C**2, axis=1) + d) # shape (n_neurons,)
-    
+    log_mu = 0.5 * np.sum(C**2, axis=1) + d
+    mu = np.exp(log_mu) # shape (n_neurons,)
+    cc = C @ C.T
+
     # covariance of log-normal Cox process approximation
-    cov = np.outer(mu, mu) * (np.exp(C @ C.T) -  1) + np.diag(mu) # shape (n_neurons, n_neurons)
+    cov = np.outer(mu, mu) * (np.exp(cc) - 1.0) + np.diag(mu) 
     
     return cov, mu
+
+def var_explained(raw_cov, approx_cov, approx_mu):
+    """
+    Fraction of variance explained by the shared latent covariance
+    of the Poisson-GPFA model.
+    """
+    total_variance = float(np.trace(raw_cov))
+    shared_cov = approx_cov - np.diag(approx_mu)
+    shared_variance = float(np.trace(shared_cov))
+
+    return shared_variance / total_variance
+
+
+# GPFA Plotting functions 
+
+def plot_explained_variance(
+    explained_variances,
+    figure_size=(3.5, 3)
+):
+    """
+    Violin plot of explained variance per condition, split by running phase.
+    """
+    phase_colors = {0: "steelblue", 1: "crimson"}
+    phase_labels = {0: "Still", 1: "Running"}
+
+    ve_by_phase = {0: [], 1: []}
+    for (_, _, running_phase), ve in explained_variances.items():
+        ve_by_phase[running_phase].append(ve)
+
+    fig, ax = plt.subplots(figsize=figure_size)
+
+    data = [ve_by_phase[0], ve_by_phase[1]]
+    violins = ax.violinplot(
+        data,
+        positions=[1, 2],
+        widths=0.6,
+        showmeans=False,
+        showmedians=True,
+        showextrema=False,
+    )
+
+    for body, phase in zip(violins["bodies"], (0, 1)):
+        body.set_facecolor(phase_colors[phase])
+        body.set_alpha(0.6)
+
+    # overlay individual points
+    for i, phase in enumerate((0, 1), start=1):
+        y = ve_by_phase[phase]
+        x = np.random.normal(i, 0.04, size=len(y))
+        ax.scatter(
+            x,
+            y,
+            color=phase_colors[phase],
+            edgecolor="black",
+            s=20,
+            alpha=0.7,
+            zorder=3,
+        )
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels([phase_labels[0], phase_labels[1]])
+    ax.set_ylabel("FVE")
+    fig.tight_layout()
+
+    return fig, ax
+
+def plot_covariances(
+    raw_cov,
+    approx_cov,
+    figure_size=(6, 3),
+    cmap="RdBu_r",
+):
+    """
+    Plot raw covariance and GPFA covariance approximation.
+    """
+
+    fig, axes = plt.subplots(1, 2, figsize=figure_size, constrained_layout=True)
+    vmax = max(np.abs(raw_cov).max(), np.abs(approx_cov).max())
+    im = axes[0].imshow(raw_cov, cmap=cmap, vmin=-vmax, vmax=vmax)
+    axes[0].set_title("Raw")
+    axes[0].set_xlabel("Neuron")
+    axes[0].set_ylabel("Neuron")
+
+    axes[1].imshow(approx_cov, cmap=cmap, vmin=-vmax, vmax=vmax)
+    axes[1].set_title("GPFA approximation")
+    axes[1].set_xlabel("Neuron")
+
+    fig.colorbar(im, ax=axes, label="Covariance", shrink=0.8, aspect=20)
+    return fig, axes
+
+def plot_param_histograms(
+    fits,
+    trial_keys,
+    param_name="C",
+    bins=30,
+    running_phase=0,
+    neuron_idx=None,
+    figsize_per_cell=(3, 2),
+):
+    """
+    Plot histograms of a GPFA parameter for selected conditions.
+    """
+
+    color = "steelblue" if running_phase == 0 else "crimson"
+    
+    # get the trial keys for the specified running phase
+    keys = [k for k in trial_keys if k[2] == running_phase]
+    fig, axes = plt.subplots(
+        1,
+        len(keys),
+        figsize=(figsize_per_cell[0] * len(keys), figsize_per_cell[1]),
+        squeeze=False,
+    )
+
+    for idx, key in enumerate(keys):
+        ax = axes[0, idx]
+        orientation, temporal_frequency, _ = key
+        _, _, xval = fits[key]
+        params = np.asarray(xval.fits[0].optimParams[param_name])
+        values = params.ravel()
+        ax.hist(
+            values,
+            bins=bins,
+            color=color,
+            alpha=0.5,
+            edgecolor="black",
+        )
+        if neuron_idx is not None and neuron_idx < params.shape[0]:
+            ax.axvline(
+                params[neuron_idx],
+                color="black",
+                linestyle="--",
+                linewidth=2,
+            )
+        ax.tick_params(labelsize=6)
+        ax.set_title(
+            f"Ori {orientation:g}°, TF {temporal_frequency:g} Hz",
+            fontsize=8,
+        )
+    for ax in axes[0]:
+        ax.set_xlabel(param_name)
+    axes[0, 0].set_ylabel("Frequency")
+    fig.tight_layout()
+    return fig, axes
+
+def plot_tau_histogram(
+    fits, 
+    bins=30,
+    figure_size=(4, 2.5)
+    ):
+    """
+    Plot fitted GP timescales pooled across conditions,
+    split by running phase.
+    """
+    colors = {0: "steelblue", 1: "crimson"}
+    labels = {0: "Still", 1: "Running"}
+    taus = {0: [], 1: []}
+    
+    for (_, _, phase), (_, _, xval) in fits.items():
+        for fit in xval.fits:
+            taus[phase].append(float(fit.optimParams["tau"][0]))
+
+    fig, ax = plt.subplots(figsize=(3, 2))
+    for phase in (0, 1):
+        ax.hist(
+            taus[phase],
+            bins=bins,
+            color=colors[phase],
+            alpha=0.5,
+            edgecolor="black",
+        )
+        
+    ax.set_xlabel(r"$\tau$ (s)")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    return fig, ax
+
+def plot_gpfa_latent_and_speed_grid(
+    fits,
+    trial_keys,
+    running_phase,
+    trial_idx=0,
+    figsize_per_cell=(3.5, 2),
+):
+    """
+    Plot running speed and first GPFA latent trajectory for a selected trial
+    across given conditions.
+    """
+
+    color = "steelblue" if running_phase == 0 else "crimson"
+    keys = [k for k in trial_keys if k[2] == running_phase]
+    fig, axes = plt.subplots(
+        1,
+        len(keys),
+        figsize=(figsize_per_cell[0] * len(keys), figsize_per_cell[1]),
+        squeeze=False,
+    )
+
+    for idx, key in enumerate(keys):
+        ax = axes[0, idx]
+        orientation, temporal_frequency, _ = key
+
+        _, _, xval = fits[key]
+        fit = xval.fits[0]
+        data = fit.experiment
+
+        if trial_idx >= data.numTrials:
+            ax.set_title("Trial unavailable", fontsize=9)
+            ax.axis("off")
+            continue
+
+        time = np.arange(data.T) * data.binSize / 1000
+        speed = np.asarray(data.data[trial_idx]["running_speed"])
+        latent = np.asarray(fit.infRes["post_mean"][trial_idx][0])
+
+        T = min(len(time), len(speed), len(latent))
+        ax.plot(time[:T], speed[:T], color=color)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Speed", color=color)
+        ax.tick_params(axis="y", labelcolor=color)
+        ax.set_title(f"Ori {orientation:g}°, TF {temporal_frequency:g} Hz", fontsize=9)
+
+        ax2 = ax.twinx()
+        ax2.plot(time[:T], latent[:T], color="orange", linestyle="--")
+        ax2.set_ylabel("Latent", color="orange")
+        ax2.tick_params(axis="y", labelcolor="orange")
+
+    fig.tight_layout()
+    return fig, axes
