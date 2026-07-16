@@ -163,8 +163,11 @@ class GPFADataset:
         running_speed = np.asarray(session["running_speed_filtered"][0], dtype=float)
         running_phase = np.asarray(session["running_speed_phase"], dtype=int)
 
-        for parameter, parameter_value in zip(parameters, parameter_values):
-            stim_table = stim_table[stim_table[parameter] == parameter_value].reset_index(drop=True)
+        if "blank_sweep" not in parameters:
+            for parameter, parameter_value in zip(parameters, parameter_values):
+                stim_table = stim_table[stim_table[parameter] == parameter_value].reset_index(drop=True)
+        elif "blank_sweep" in parameters:
+            stim_table = stim_table[stim_table["blank_sweep"] == 1].reset_index(drop=True)
 
         dt_sec = float(np.median(np.diff(t)))
         dt_ms = dt_sec * 1000.0
@@ -257,53 +260,59 @@ def var_explained(raw_cov, approx_cov, approx_mu):
 
 
 # GPFA Plotting functions 
-
-def plot_explained_variance(
-    explained_variances,
-    figure_size=(3.5, 3)
-):
+def plot_explained_variance(explained_variances, figure_size=(3.5, 3)):
     """
-    Violin plot of explained variance per condition, split by running phase.
+    Violin plot of explained variance split by running phase.
     """
     phase_colors = {0: "steelblue", 1: "crimson"}
     phase_labels = {0: "Still", 1: "Running"}
 
-    ve_by_phase = {0: [], 1: []}
-    for (_, _, running_phase), ve in explained_variances.items():
-        ve_by_phase[running_phase].append(ve)
+    groups = {(0, 0): [], (0, 1): [], (1, 0): [], (1, 1): []}
+    for (_, _, phase, blank), ve in explained_variances.items():
+        groups[(phase, blank)].append(ve)
 
     fig, ax = plt.subplots(figsize=figure_size)
 
-    data = [ve_by_phase[0], ve_by_phase[1]]
     violins = ax.violinplot(
-        data,
+        [groups[(0, 0)], groups[(1, 0)]],
         positions=[1, 2],
         widths=0.6,
-        showmeans=False,
         showmedians=True,
         showextrema=False,
     )
 
-    for body, phase in zip(violins["bodies"], (0, 1)):
-        body.set_facecolor(phase_colors[phase])
+    for body, color in zip(violins["bodies"], phase_colors.values()):
+        body.set_facecolor(color)
         body.set_alpha(0.6)
 
-    # overlay individual points
-    for i, phase in enumerate((0, 1), start=1):
-        y = ve_by_phase[phase]
-        x = np.random.normal(i, 0.04, size=len(y))
+    for phase, pos in enumerate([1, 2]):
+        y = groups[(phase, 0)]
         ax.scatter(
-            x,
+            np.random.normal(pos, 0.04, len(y)),
             y,
             color=phase_colors[phase],
             edgecolor="black",
             s=20,
             alpha=0.7,
-            zorder=3,
         )
+
+        y_blank = groups[(phase, 1)]
+        if y_blank:
+            ax.scatter(
+                np.random.normal(pos, 0.04, len(y_blank)),
+                y_blank,
+                color="gold",
+                edgecolor="black",
+                s=40,
+                marker="D",
+                zorder=4,
+                label="Blank sweep" if phase == 0 else None,
+            )
+
     ax.set_xticks([1, 2])
     ax.set_xticklabels([phase_labels[0], phase_labels[1]])
     ax.set_ylabel("FVE")
+    ax.legend(fontsize=7)
     fig.tight_layout()
 
     return fig, ax
@@ -358,7 +367,7 @@ def plot_param_histograms(
 
     for idx, key in enumerate(keys):
         ax = axes[0, idx]
-        orientation, temporal_frequency, _ = key
+        orientation, temporal_frequency, _, blank_sweep = key
         _, _, xval = fits[key]
         params = np.asarray(xval.fits[0].optimParams[param_name])
         values = params.ravel()
@@ -377,45 +386,52 @@ def plot_param_histograms(
                 linewidth=2,
             )
         ax.tick_params(labelsize=6)
-        ax.set_title(
-            f"Ori {orientation:g}°, TF {temporal_frequency:g} Hz",
-            fontsize=8,
-        )
+        if not blank_sweep:
+            ax.set_title(
+                f"Ori {orientation:g}°, TF {temporal_frequency:g} Hz", 
+                fontsize=8,
+            )
+        elif blank_sweep:
+            ax.set_title(
+                f"Blank Sweep", 
+                fontsize=8,
+            )
     for ax in axes[0]:
         ax.set_xlabel(param_name)
     axes[0, 0].set_ylabel("Frequency")
     fig.tight_layout()
     return fig, axes
 
-def plot_tau_histogram(
-    fits, 
-    bins=30,
-    figure_size=(4, 2.5)
-    ):
+def plot_tau_histogram(fits, bins=30, figure_size=(4, 2.5)):
     """
-    Plot fitted GP timescales pooled across conditions,
-    split by running phase.
+    Plot fitted GP timescales pooled across conditions, split by running
+    phase.
     """
     colors = {0: "steelblue", 1: "crimson"}
     labels = {0: "Still", 1: "Running"}
     taus = {0: [], 1: []}
-    
-    for (_, _, phase), (_, _, xval) in fits.items():
-        for fit in xval.fits:
-            taus[phase].append(float(fit.optimParams["tau"][0]))
+    blank_taus = {0: [], 1: []}
 
-    fig, ax = plt.subplots(figsize=(3, 2))
+    for (_, _, phase, blank_sweep), (_, _, xval) in fits.items():
+        for fit in xval.fits:
+            tau = float(fit.optimParams["tau"][0])
+            if blank_sweep:
+                blank_taus[phase].append(tau)
+            else:
+                taus[phase].append(tau)
+
+    fig, ax = plt.subplots(figsize=figure_size)
     for phase in (0, 1):
-        ax.hist(
-            taus[phase],
-            bins=bins,
-            color=colors[phase],
-            alpha=0.5,
-            edgecolor="black",
-        )
-        
+        ax.hist(taus[phase], bins=bins, color=colors[phase], alpha=0.5,
+                edgecolor="black", label=labels[phase])
+
+        for tau in blank_taus[phase]:
+            ax.axvline(tau, color="gold", linestyle="--", linewidth=2, zorder=3,
+                       label="Blank sweep" if tau == blank_taus[phase][0] and phase == 0 else None)
+
     ax.set_xlabel(r"$\tau$ (s)")
     ax.set_ylabel("Count")
+    ax.legend(fontsize=7)
     fig.tight_layout()
     return fig, ax
 
@@ -442,7 +458,7 @@ def plot_gpfa_latent_and_speed_grid(
 
     for idx, key in enumerate(keys):
         ax = axes[0, idx]
-        orientation, temporal_frequency, _ = key
+        orientation, temporal_frequency, _, blank_sweep = key
 
         _, _, xval = fits[key]
         fit = xval.fits[0]
@@ -462,7 +478,10 @@ def plot_gpfa_latent_and_speed_grid(
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Speed", color=color)
         ax.tick_params(axis="y", labelcolor=color)
-        ax.set_title(f"Ori {orientation:g}°, TF {temporal_frequency:g} Hz", fontsize=9)
+        if not blank_sweep:
+            ax.set_title(f"Ori {orientation:g}°, TF {temporal_frequency:g} Hz", fontsize=9)
+        else:
+            ax.set_title("Blank Sweep", fontsize=9)
 
         ax2 = ax.twinx()
         ax2.plot(time[:T], latent[:T], color="orange", linestyle="--")
