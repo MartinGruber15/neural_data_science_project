@@ -4,7 +4,9 @@ from pathlib import Path
 import pickle
 from scipy import optimize as opt
 import matplotlib.pyplot as plt
+from scipy.stats import binned_statistic, linregress, pearsonr, spearmanr
 
+# ----------------------------- data loading and saving utils -----------------------------
 # load the data
 def load_data(path="../data"):
     raw = dict(np.load(Path(path) / "visual_coding_data.npz", allow_pickle=True))
@@ -58,7 +60,313 @@ def save_data(data, filename):
 def load_saved_data(filename):
     with open("../data/" + filename, "rb") as f:
         return pickle.load(f)
-    
+
+#----------------------------- Running speed - neural activity analysis utils #-----------------------------
+
+# Select only phases without stimulus to avoid mixing up stimulus and running speed influence
+def spontaneous_mask(session):
+    """Boolean mask selecting spontaneous imaging frames."""
+    n_frames = session["spikes"].shape[1]
+    mask = np.zeros(n_frames, dtype=bool)
+    spontaneous = session["stim_epoch_table"]
+    spontaneous = spontaneous[spontaneous["stimulus"] == "spontaneous"]
+    for _, row in spontaneous.iterrows():
+        mask[int(row.start):int(row.end)] = True
+    return mask
+
+# create (equal-sized) temporal bins for speed and spikes
+def temporal_bin(speed, spikes, fps=30, seconds=1):
+    """
+    Average running speed and dF/F into fixed-duration bins.
+
+    Parameters
+    ----------
+    speed : (T,)
+    spikes : (N,T)
+    """
+    bin_size = int(round(fps * seconds))
+    n_bins = speed.size // bin_size
+    speed = speed[:n_bins * bin_size]
+    spikes = spikes[:, :n_bins * bin_size]
+    speed_binned = speed.reshape(n_bins, bin_size).mean(axis=1)
+    spikes_binned = (
+        spikes
+        .reshape(spikes.shape[0], n_bins, bin_size)
+        .mean(axis=2)
+    )
+    return speed_binned, spikes_binned
+
+# Analyze spike activity modulation via running speed by correlating these two with pearson and
+# spearman correlation and perform a linear regression to obtain explained variance. Returns a
+# dataframe with results of correlation and linear regression. Requires binned speed and spike
+# data as input
+def analyze_running_modulation(speed, spikes):
+    results = []
+    for neuron in range(spikes.shape[0]):
+        y = spikes[neuron]
+        valid = np.isfinite(speed) & np.isfinite(y)
+        x = speed[valid]
+        y = y[valid]
+        if len(x) < 20:
+            continue
+        pearson_r, _ = pearsonr(x, y)
+        spearman_rho, _ = spearmanr(x, y)
+        fit = linregress(x, y)
+        results.append({
+            "neuron": neuron,
+            "pearson_r": pearson_r,
+            "spearman_rho": spearman_rho,
+            "slope": fit.slope,
+            "intercept": fit.intercept,
+            "r2": fit.rvalue ** 2,
+        })
+    return pd.DataFrame(results)
+
+# Applies the above methods to apply correlational and linear regression analysis on the binned
+# data of spontaneous phases.
+def perform_running_modulation_analysis(data):
+    results = {}
+    binned_data = {}
+    for name, session in data["sessions"].items():
+        mask = spontaneous_mask(session)
+        speed = session["running_speed_filtered"][0, mask]
+        spikes = session["spikes"][:, mask]
+        binned_data[name] = temporal_bin(speed, spikes, seconds=0.1)
+        results[name] = analyze_running_modulation(binned_data[name][0], binned_data[name][1])
+    return results, binned_data
+
+#----------------------------- Running speed - neural activity analysis plotting functions -----------------------------
+
+# shows the linear regression line and correlation between running speed and neural activity as well as
+# the mean spike rate for each speed bin for one neuron
+def plot_running_modulation_neuron(binned_data, all_results, session, neuron):
+    speed, spikes = binned_data[session]
+    row = all_results[session].query("neuron == @neuron").iloc[0]
+    y = spikes[neuron]
+    m = np.isfinite(speed) & np.isfinite(y)
+    x, y = speed[m], y[m]
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.scatter(x, y, s=5, alpha=0.15, color="gray", label="Samples")
+    xx = np.linspace(x.min(), x.max(), 100)
+    ax.plot(xx, row.intercept + row.slope * xx,
+            color="crimson", lw=2, label="Linear fit")
+    mean, edges, _ = binned_statistic(x, y, statistic="mean", bins=15)
+    centers = (edges[:-1] + edges[1:]) / 2
+    ax.plot(centers, mean, "-o",
+            color="royalblue", ms=4, lw=2, label="Binned mean")
+    ax.set_xlabel("Running speed")
+    ax.set_ylabel("Mean spikes")
+    ax.set_title(f"{session} N{neuron}  r={row.pearson_r:.2f}")
+    ax.legend(frameon=False)
+
+# shows the linear regression line and correlation between running speed and neural activity as well as
+# the mean spike rate for each speed bin for all neurons
+def plot_running_modulation_all(binned_data, all_results, session, cols=6):
+    speed, spikes = binned_data[session][0], binned_data[session][1]
+    df = all_results[session]
+    n = len(df)
+    rows = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(2.5 * cols, 2 * rows), sharex=True, sharey=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, row in zip(axes, df.itertuples()):
+        y = spikes[row.neuron]
+        m = np.isfinite(speed) & np.isfinite(y)
+        x, y = speed[m], y[m]
+
+        mean, edges, _ = binned_statistic(x, y, statistic="mean", bins=15)
+        centers = (edges[:-1] + edges[1:]) / 2
+
+        ax.plot(centers, mean, "-o", c="royalblue", ms=2)
+        xx = np.linspace(x.min(), x.max(), 100)
+        ax.plot(xx, row.intercept + row.slope * xx, c="crimson", lw=1)
+        ax.set_title(f"N{row.neuron} r={row.pearson_r:.2f}", fontsize=8)
+    for ax in axes[n:]:
+        fig.delaxes(ax)
+    fig.supxlabel("Running speed")
+    fig.supylabel("Mean spikes")
+
+# plots the distribution of correlations as a histogram
+def plot_correlation_histograms(all_results):
+    fig, axes = plt.subplots(1, len(all_results), figsize=(3 * len(all_results), 2.5), sharex=True, sharey=True)
+    axes = np.atleast_1d(axes)
+
+    for ax, (session, df) in zip(axes, all_results.items()):
+        ax.hist(df.pearson_r, bins=15, color="steelblue", edgecolor="white")
+        ax.axvline(0, c="k", ls="--", lw=1)
+        ax.set_title(session)
+        ax.set_xlabel("Pearson r")
+
+    axes[0].set_ylabel("Neurons")
+    plt.tight_layout(pad=.3)
+
+# plots the neurons correlations sorted by strength (alternative to histogram)
+def plot_running_correlations(all_results):
+    fig, axes = plt.subplots(1, len(all_results), figsize=(3 * len(all_results), 2.5), sharey=True)
+    axes = np.atleast_1d(axes)
+    for ax, (session, df) in zip(axes, all_results.items()):
+        ax.plot(np.sort(df.pearson_r), "o-", ms=3)
+        ax.axhline(0, c="k", ls="--", lw=1)
+        ax.set_title(session)
+        ax.set_xlabel("Neuron")
+    axes[0].set_ylabel("Pearson r")
+
+# plots the neurons correlation consistence across sessions (note: data for session c is very sparse)
+def plot_running_correlation_sessions(all_results):
+    sessions = list(all_results)
+    fig, ax = plt.subplots(figsize=(6, 3))
+    for n in range(len(all_results[sessions[0]])):
+        ax.plot(sessions, [all_results[s].iloc[n].pearson_r for s in sessions], c="gray", alpha=.25)
+    for s in sessions:
+        ax.scatter([s] * len(all_results[s]), all_results[s].pearson_r, label=s)
+    ax.axhline(0, c="k", ls="--", lw=1)
+    ax.set_ylabel("Pearson r")
+    ax.legend()
+    plt.tight_layout(pad=.3)
+
+
+#----------------------------- Running onset - neural activity analysis utils -----------------------------
+
+# detects running onsets
+def detect_running_onsets(session, pre=30, post=30):
+    phase = session["running_speed_phase"]
+    spont = spontaneous_mask(session)
+
+    onsets = []
+
+    for i in range(0, len(phase) - post):
+        if phase[i - 1] != 0 or phase[i] != 1:
+            continue
+        if not spont[i - pre:i + post].all():
+            continue
+        onsets.append(i)
+
+    return np.asarray(onsets)
+
+# extracts onset windows
+def extract_onset_windows(spikes, onsets, pre=30, post=30):
+    windows = np.stack([
+        spikes[:, i - pre:i + post]
+        for i in onsets
+    ])
+    return windows
+
+# takes onset windows as input, computes the diff as mean after - mean before
+# and tests the onset modulation significance using a sign-flip permutation test
+def running_onset_analysis(windows, pre=30, n_perm=10000):
+    baseline = windows[:, :, :pre].mean(axis=2)
+    response = windows[:, :, pre:].mean(axis=2)
+    results = []
+    for neuron in range(windows.shape[1]):
+        diff = response[:, neuron] - baseline[:, neuron]
+        observed = diff.mean()
+        null = np.empty(n_perm)
+        for i in range(n_perm):
+            signs = np.random.choice([-1, 1], size=len(diff))
+            null[i] = np.mean(diff * signs)
+        p = (np.sum(null >= observed) + 1) / (n_perm + 1)
+        results.append({
+            "neuron": neuron,
+            "baseline": baseline[:, neuron].mean(),
+            "response": response[:, neuron].mean(),
+            "delta": observed,
+            "p": p,
+            "n_events": len(diff),
+        })
+    return pd.DataFrame(results)
+
+# applies the methods above to test onset modulation significance
+def perform_onset_modulation_analysis(data):
+    onset_results = {}
+    onset_data = {}
+    for name, session in data["sessions"].items():
+        onsets = detect_running_onsets(session)
+        windows = extract_onset_windows(session["spikes"],onsets)
+        onset_data[name] = {"onsets": onsets,"windows": windows,}
+        onset_results[name] = running_onset_analysis(windows)
+    return onset_results, onset_data
+
+# uses a score to rank consistency of onset responses
+def onset_consistency(onset_results):
+    out = pd.DataFrame(index=onset_results[next(iter(onset_results))].neuron)
+    for session, df in onset_results.items():
+        out[session] = df.set_index("neuron").delta
+    out["mean_delta"] = out.mean(axis=1)
+    return out.sort_values("mean_delta", ascending=False)
+
+#----------------------------- Running onset - neural activity analysis plotting functions ---------------------------
+
+# plots the distribution of onset deltas (mean after minus mean before) over the neurons
+def plot_onset_delta(onset_results):
+    fig, axes = plt.subplots(1, len(onset_results), figsize=(3 * len(onset_results), 2.5), sharey=True)
+    axes = np.atleast_1d(axes)
+    for ax, (name, df) in zip(axes, onset_results.items()):
+        ax.hist(df.delta, bins=20, color="steelblue", edgecolor="white")
+        ax.axvline(0, c="k", ls="--")
+        ax.set_title(name)
+        ax.set_xlabel("Running onset Δ firing")
+    axes[0].set_ylabel("Neurons")
+
+# plots the mean onset response and standard deviation of one neuron in a particular session
+def plot_onset_neuron(onset_data, session, neuron):
+    w = onset_data[session]["windows"][:, neuron]
+    mean = w.mean(axis=0)
+    sem = w.std(axis=0) / np.sqrt(len(w))
+    t = np.arange(len(mean)) - 30
+    plt.figure(figsize=(5, 3))
+    plt.plot(t, mean, c="k")
+    plt.fill_between(t, mean - sem, mean + sem, alpha=.3)
+    plt.axvline(0, c="r", ls="--")
+    plt.xlabel("Frames from running onset")
+    plt.ylabel("Spike rate")
+
+# plots the mean onset response and standard deviation over all neurons in a particular session
+def plot_population_onset(onset_data, session, pre=30):
+    w = onset_data[session]["windows"]
+    trace = w.mean(axis=0)
+    mean = trace.mean(axis=0)
+    sem = trace.std(axis=0) / np.sqrt(trace.shape[0])
+    t = np.arange(len(mean)) - pre
+    plt.figure(figsize=(5, 3))
+    plt.plot(t, mean)
+    plt.fill_between(t, mean - sem, mean + sem, alpha=.3)
+    plt.axvline(0, c="r", ls="--")
+    plt.xlabel("Frames from onset")
+    plt.ylabel("Population firing")
+
+# Alternative heatmap visualization of population tuning onsets with neurons stacked
+def plot_onset_population(onset_data, session, pre=30):
+    w = onset_data[session]["windows"]  # events x neurons x time
+    activity = w.mean(axis=0)
+    order = np.argsort(activity[:, pre:].mean(axis=1))[::-1]
+    activity = activity[order]
+    t = np.arange(activity.shape[1]) - pre
+    fig, ax = plt.subplots(
+        2, 1,
+        figsize=(7, 5),
+        gridspec_kw={"height_ratios":[3,1]},
+        sharex=True
+    )
+    # neurons x time heatmap
+    im = ax[0].imshow(
+        activity,
+        aspect="auto",
+        cmap="viridis",
+        extent=[t[0], t[-1], 0, activity.shape[0]]
+    )
+    ax[0].axvline(0, c="r", ls="--")
+    ax[0].set_ylabel("Neuron (sorted by strength)")
+    # population response
+    mean = activity.mean(axis=0)
+    sem = activity.std(axis=0)/np.sqrt(activity.shape[0])
+    ax[1].plot(t, mean, c="k")
+    ax[1].fill_between(t, mean-sem, mean+sem, alpha=.3)
+    ax[1].axvline(0, c="r", ls="--")
+    ax[1].set_xlabel("Time from running onset (frames)")
+    ax[1].set_ylabel("Spike rate")
+
+# ----------------------------- Tuning Analysis utils -----------------------------
+
 def vonMises(θ: np.ndarray, α: float, κ: float, ν: float, ϕ: float) -> np.ndarray:
     """Evaluate the parametric von Mises tuning curve with parameters p at locations theta.
     """
