@@ -11,3 +11,6 @@ dependencies:
   - jupyter
   - scipy
   - jupyter_black
+
+  - pip:
+      - git+https://github.com/berenslab/poisson-gpfa.git

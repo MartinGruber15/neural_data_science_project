@@ -481,9 +481,7 @@ class GPFADataset:
         dt_ms = dt_sec * 1000.0
 
         T = int(minimum_nr_of_bins)
-        T -= T % 2  # keep even
-        if T < 1:
-            raise ValueError("minimum_nr_of_bins must be >= 2 (kept even).")
+        T -= T % 2  # keep even, GPFA somehow requires this
 
         self.binSize = dt_ms
         self.ydim = spikes.shape[0]
@@ -493,7 +491,8 @@ class GPFADataset:
         self.parameter_values = parameter_values
         self.running_phase_value = running_phase_value
         self.T = T
-
+        
+        # empty dataset
         if stim_table.empty:
             self.data, self.trial_durs, self.trialDur, self.numTrials = [], [], 0, 0
             return
@@ -510,7 +509,8 @@ class GPFADataset:
             Y = spikes[:, start:stop].clip(min=0.0)
             speed = running_speed[start:stop]
             phase = running_phase[start:stop]
-
+            
+            # Constrain spikes to running phase bins
             if running_phase_value is not None:
                 mask = phase == int(running_phase_value)
                 if mask.sum() < T:
@@ -565,7 +565,6 @@ def var_explained(raw_cov, approx_cov, approx_mu):
     shared_variance = float(np.trace(shared_cov))
 
     return shared_variance / total_variance
-
 
 # GPFA Plotting functions 
 def plot_explained_variance(explained_variances, figure_size=(3.5, 3)):
@@ -663,7 +662,6 @@ def plot_param_histograms(
     """
 
     color = "steelblue" if running_phase == 0 else "crimson"
-    
     # get the trial keys for the specified running phase
     keys = [k for k in trial_keys if k[2] == running_phase]
     fig, axes = plt.subplots(
@@ -710,32 +708,30 @@ def plot_param_histograms(
     fig.tight_layout()
     return fig, axes
 
-def plot_tau_histogram(fits, bins=30, figure_size=(4, 2.5)):
+def plot_tau_histogram(
+    fits, 
+    bins=30, 
+    figure_size=(4, 2.5)
+):
     """
-    Plot fitted GP timescales pooled across conditions, split by running
-    phase.
+    Plot fitted GP timescales pooled across conditions, 
+    split by running phase.
     """
     colors = {0: "steelblue", 1: "crimson"}
     labels = {0: "Still", 1: "Running"}
     taus = {0: [], 1: []}
-    blank_taus = {0: [], 1: []}
 
     for (_, _, phase, blank_sweep), (_, _, xval) in fits.items():
+        if blank_sweep:
+            continue
         for fit in xval.fits:
             tau = float(fit.optimParams["tau"][0])
-            if blank_sweep:
-                blank_taus[phase].append(tau)
-            else:
-                taus[phase].append(tau)
+            taus[phase].append(tau)
 
     fig, ax = plt.subplots(figsize=figure_size)
     for phase in (0, 1):
         ax.hist(taus[phase], bins=bins, color=colors[phase], alpha=0.5,
                 edgecolor="black", label=labels[phase])
-
-        for tau in blank_taus[phase]:
-            ax.axvline(tau, color="gold", linestyle="--", linewidth=2, zorder=3,
-                       label="Blank sweep" if tau == blank_taus[phase][0] and phase == 0 else None)
 
     ax.set_xlabel(r"$\tau$ (s)")
     ax.set_ylabel("Count")
@@ -751,8 +747,8 @@ def plot_gpfa_latent_and_speed_grid(
     figsize_per_cell=(3.5, 2),
 ):
     """
-    Plot running speed and first GPFA latent trajectory for a selected trial
-    across given conditions.
+    Plot running speed and GPFA latent trajectory for a selected trial
+    across given conditions (keys).
     """
 
     color = "steelblue" if running_phase == 0 else "crimson"
