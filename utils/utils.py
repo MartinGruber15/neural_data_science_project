@@ -441,6 +441,64 @@ def testTuning(
 
     return p_value, q_abs, qs_abs_shuffled
 
+def plot_tuning_curves(
+    fitted_params,
+    p_values=None,
+    n_cols=4,
+    alpha=0.05,
+    psi=2,
+    only_significant=False,
+):
+    """Plot per-cell trial rates and von Mises fit..
+    """
+    if only_significant:
+        if p_values is None:
+            raise ValueError("p_values must be provided when only_significant=True.")
+        fitted_params = [e for e in fitted_params if p_values.get(int(e["cell"]), 1) < alpha]
+
+    n_cells = len(fitted_params)
+
+    n_rows = int(np.ceil(n_cells / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2 * n_cols, 2 * n_rows), squeeze=False)
+    theta_range = np.linspace(0, np.max([entry["stimulus_parameters"] for entry in fitted_params]), 200)
+    speed_phase = fitted_params[0]['speed_phase'] if fitted_params else 0
+    curve_color = "steelblue" if speed_phase == 0 else "crimson"
+
+    for i, entry in enumerate(fitted_params):
+        row, col = divmod(i, n_cols)
+        ax = axes[row, col]
+
+        cell = int(entry["cell"])
+        stim = np.asarray(entry["stimulus_parameters"], dtype=float)
+        counts = np.asarray(entry["spike_counts"], dtype=float)
+        unique_stim = np.unique(stim)
+        mean_counts = np.array([np.mean(counts[stim == us]) for us in unique_stim])
+        alpha_vm, kappa_vm, nu_vm, phi_vm = entry["van-mises-params"]
+
+        ax.scatter(unique_stim, mean_counts, color="black", s=12, label="Mean spike count")
+        fitted_curve = vonMises(theta_range, alpha_vm, kappa_vm, nu_vm, phi_vm)
+        ax.plot(theta_range, fitted_curve, color=curve_color, label="von Mises fit", linewidth=3)
+
+        is_sig = p_values is not None and p_values.get(cell, 1) < alpha
+        ax.set_title(f"Cell {cell}", fontsize=12, color="green" if is_sig and not only_significant else "black")
+        if is_sig:
+            for spine in ax.spines.values():
+                spine.set_edgecolor("green" if not only_significant else "black")
+                spine.set_linewidth(2)
+        if i == 0:
+            ax.set_xlabel("Orientation (deg)", fontsize=12)
+            ax.set_ylabel("Spike count", fontsize=12)
+
+        ymax = max(fitted_curve.max(), mean_counts.max(), 1e-6)
+        ax.set_ylim(bottom=0, top=ymax * 1.5)
+
+    for j in range(n_cells, n_rows * n_cols):
+        row, col = divmod(j, n_cols)
+        axes[row, col].axis("off")
+
+    fig.tight_layout()
+    return fig, axes
+
 
 # ------------------ GPFA utils -----------------------------------
 class GPFADataset:
@@ -480,7 +538,7 @@ class GPFADataset:
         dt_sec = float(np.median(np.diff(t)))
         dt_ms = dt_sec * 1000.0
 
-        T = int(minimum_nr_of_bins)
+        T = minimum_nr_of_bins
         T -= T % 2  # keep even, GPFA somehow requires this
 
         self.binSize = dt_ms
@@ -535,7 +593,6 @@ class GPFADataset:
             )
 
         self.data = trials
-        self.trial_durs = [T * dt_ms] * len(trials)
         self.trialDur = T * dt_ms
         self.numTrials = len(trials)
 
