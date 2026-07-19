@@ -5,6 +5,16 @@ import pickle
 from scipy import optimize as opt
 import matplotlib.pyplot as plt
 from scipy.stats import binned_statistic, linregress, pearsonr, spearmanr
+from oasis.functions import deconvolve
+from scipy import signal
+import seaborn as sns
+
+STIMULUS_SESSION_MAP = {
+    "drifting_gratings": "A",
+    "static_gratings": "B",
+    "natural_scenes": "B",
+    "locally_sparse_noise": "C",
+}
 
 # ----------------------------- data loading and saving utils -----------------------------
 # load the data
@@ -61,7 +71,810 @@ def load_saved_data(filename):
     with open("../data/" + filename, "rb") as f:
         return pickle.load(f)
 
+# ----------------------------- data preprocessing (oasis and speed) -----------------------------
+
+# spike inference for one session
+def infer_spikes_oasis(session, fs):
+    dff = session["dff"]
+    n_cells, n_time = dff.shape
+    spikes = np.zeros_like(dff)
+    calcium = np.zeros_like(dff)
+    for i in range(n_cells):
+        c, s, b, g, lam = deconvolve(dff[i], penalty = 1) # tau_d=0.1, framerate=fs)
+        spikes[i] = s
+        calcium[i] = c
+    return spikes, calcium
+
+# spike inference for all sessions
+def spike_inference(data):
+    for name, session in data["sessions"].items():
+        fs = 1.0 / np.median(np.diff(session["t"]))
+        spikes, calcium = infer_spikes_oasis(session, fs)
+        session["spikes"] = spikes
+        session["calcium_fit"] = calcium
+    return data
+
+# plot spike inference result for one session
+def plot_oasis_result(data, session):
+    plt.figure(figsize=(15, 4))
+    plt.plot(data["sessions"][session]["t"], data["sessions"][session]["dff"][0], label="ΔF/F")
+    plt.plot(data["sessions"][session]["t"], data["sessions"][session]["spikes"][0], label="OASIS output")
+    plt.legend()
+
+# Running speed filtering and running phase extraction
+def preprocess_running_speed(
+    data: dict,
+    high: float = 3.0,
+    order: int = 3,
+    clip_speed: bool = True,
+    running_threshold: float = 2.0,
+    ) -> dict:
+
+    for name, session in data["sessions"].items():
+        speed = np.asarray(session["running_speed"][0], dtype=float)
+        t = np.asarray(session["running_speed"][1], dtype=float)
+        dt = np.median(np.diff(t))
+
+        fs = 1.0 / dt
+        nyquist = 0.5 * fs
+        if not (0 < high < nyquist):
+            raise ValueError(f"{name}: high must be between 0 and {nyquist:.3f} Hz, got {high}")
+
+        valid = np.isfinite(speed)
+
+        # We have nans at beginning and end of the speed trace,
+        # so we need to interpolate to fill them in before filtering.
+        speed_interp = np.interp(
+            np.arange(speed.size),
+            np.flatnonzero(valid),
+            speed[valid],
+        )
+
+        b, a = signal.butter(order, high, btype="low", fs=fs)
+        speed_filtered = signal.filtfilt(b, a, speed_interp)
+
+        # clip running speed at 0
+        if clip_speed:
+            speed_filtered = np.clip(speed_filtered, 0, None)
+
+        # Separate filtered speed into two kinematic phases: still (0) vs running (1).
+        phases = np.full(speed_filtered.shape, -1, dtype=int)
+        phases[speed_filtered <= running_threshold] = 0
+        phases[speed_filtered > running_threshold] = 1
+
+        # Restore missing values in filtered signal while keeping phase=-1 for invalid points.
+        speed_filtered[~valid] = np.nan
+        phases[~valid] = -1
+        session["running_speed_filtered"] = np.vstack([speed_filtered, t])
+        session["running_speed_phase"] = phases
+
+    return data
+
+# plot filtered/unfiltered running speed comparison
+def plot_running_speed(data, session="B", t=(0, 100)):
+    """Plot raw and filtered running speed with phase background blocks."""
+    session_data = data["sessions"][session]
+
+    speed_raw, time_raw = (np.asarray(a, dtype=float) for a in session_data["running_speed"])
+    speed_filt, time_filt = (np.asarray(a, dtype=float) for a in session_data["running_speed_filtered"])
+
+    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+    axs[0].plot(time_raw, speed_raw, color="0.2", lw=0.8)
+    axs[0].set(xlim=t, title="Original Running Speed", ylabel="Speed (cm/s)")
+
+    axs[1].plot(time_filt, speed_filt, color="0.2", lw=0.8)
+    axs[1].set(xlim=t, title="Filtered Running Speed", ylabel="Speed (cm/s)", xlabel="Time (s)")
+
+    # Shade contiguous phase blocks on both subplots.
+
+    phase = np.asarray(session_data["running_speed_phase"], dtype=int)
+
+    phase_names = {-1: "Invalid", 0: "Still", 1: "Running"}
+    phase_colors = {-1: "0.8", 0: "tab:blue", 1: "tab:red"}
+
+    change_points = np.flatnonzero(np.diff(phase)) + 1  # get the indices where the phase changes
+    block_starts = np.concatenate(([0], change_points))
+    block_ends = np.concatenate((change_points, [phase.size]))
+
+    seen_labels = set()
+    for start, end in zip(block_starts, block_ends):
+        p = phase[start]
+        label = phase_names.get(p, f"Phase {p}") if p not in seen_labels else None
+        seen_labels.add(p)
+        for ax in axs:
+            ax.axvspan(
+                time_filt[start], time_filt[end - 1],
+                color=phase_colors.get(p, "0.5"), alpha=0.2, label=label,
+            )
+
+    axs[1].legend(loc="upper right")
+    fig.tight_layout()
+    return fig, axs
+
+# ----------------------------Exploratory analysis utils --------------------------------
+def plot_spike_raster(data, session, ax=None, threshold=0.05, xlim=None):
+    """
+    Plot a raster plot of inferred spike activity across all neurons in a session.
+    Each row is a neuron; each vertical tick marks a time point where spike
+    activity exceeds the threshold (since OASIS output is continuous, not binary).
+
+    Parameters
+    ----------
+    threshold : float
+        Minimum spike value to count as a "spike event" for raster display.
+        Adjust based on your data's typical spike amplitude range.
+    xlim : tuple, optional
+        (start_time, end_time) in seconds to zoom into a specific window.
+    """
+    s = data["sessions"][session]
+    spikes = s["spikes"]  # shape (n_cells, n_timepoints)
+    t = s["t"]
+    n_cells = spikes.shape[0]
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(12, 6))
+
+    for cell_idx in range(n_cells):
+        spike_times = t[spikes[cell_idx] > threshold]
+        ax.vlines(spike_times, cell_idx + 0.5, cell_idx + 1.5, color="black", linewidth=0.5)
+
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("neuron #")
+    ax.set_ylim(0.5, n_cells + 0.5)
+    ax.set_title(f"session {session}: spike raster ({n_cells} neurons)")
+
+    if xlim is not None:
+        ax.set_xlim(xlim)
+
+    return ax
+
+def plot_spike_raster_with_running_all_sessions(data, sessions=["A", "B", "C"],
+                                                    threshold=0.02, xlim=None,
+                                                    use_filtered_speed=True):
+    """
+    Plot spike raster + running speed for multiple sessions, stacked vertically,
+    for easy side-by-side comparison.
+    """
+    n_sessions = len(sessions)
+    fig, axes = plt.subplots(
+        n_sessions * 2, 1, figsize=(12, 4 * n_sessions),
+        gridspec_kw={"height_ratios": [3, 1] * n_sessions}
+    )
+
+    for i, session in enumerate(sessions):
+        ax_raster = axes[i * 2]
+        ax_speed = axes[i * 2 + 1]
+
+        s = data["sessions"][session]
+        spikes = s["spikes"]
+        t = s["t"]
+        n_cells = spikes.shape[0]
+
+        speed_key = "running_speed_filtered" if use_filtered_speed else "running_speed"
+        speed = s[speed_key][0]
+        t_speed = s[speed_key][1]
+
+        # Raster
+        for cell_idx in range(n_cells):
+            spike_times = t[spikes[cell_idx] > threshold]
+            ax_raster.vlines(spike_times, cell_idx + 0.5, cell_idx + 1.5,
+                              color="black", linewidth=0.5)
+        ax_raster.set_ylabel("neuron #")
+        ax_raster.set_ylim(0.5, n_cells + 0.5)
+        ax_raster.set_title(f"session {session}: spike raster ({n_cells} neurons)")
+
+        # Running speed
+        ax_speed.plot(t_speed, speed, lw=0.8, color="darkorange")
+        ax_speed.set_ylabel("speed\n(cm/s)")
+
+        if xlim is not None:
+            ax_raster.set_xlim(xlim)
+            ax_speed.set_xlim(xlim)
+
+    axes[-1].set_xlabel("time (s)")
+    plt.tight_layout()
+    return fig, axes
+
+
+def add_stimulus_shading(ax, data, session, t, xlim=None):
+    """
+    Shade the time windows during which any stimulus was being presented,
+    using each stimulus's own stim_table (start/end indices into t).
+    """
+    s = data["sessions"][session]
+    session_stims = [name for name, sess in STIMULUS_SESSION_MAP.items() if sess == session]
+
+    for stim_name in session_stims:
+        stim_table = s["stim_tables"][stim_name]
+        starts = stim_table["start"].astype(int).values
+        ends = stim_table["end"].astype(int).values
+
+        for start_idx, end_idx in zip(starts, ends):
+            start_t, end_t = t[start_idx], t[end_idx]
+            if xlim is not None and (end_t < xlim[0] or start_t > xlim[1]):
+                continue
+            ax.axvspan(start_t, end_t, color="steelblue", alpha=0.15, zorder=0)
+
+
+def plot_spike_raster_with_running(data, session, threshold=0.05, xlim=None,
+                                   use_filtered_speed=True, figsize=(12, 8)):
+    """
+    Plot a raster plot of inferred spike activity (top) alongside the
+    running speed trace (bottom), with blue shading marking stimulus
+    presentation windows.
+    """
+    STIMULUS_SESSION_MAP = {
+        "drifting_gratings": "A",
+        "static_gratings": "B",
+        "natural_scenes": "B",
+        "locally_sparse_noise": "C",
+    }
+
+    s = data["sessions"][session]
+    spikes = s["spikes"]
+    t = s["t"]
+    n_cells = spikes.shape[0]
+
+    speed_key = "running_speed_filtered" if use_filtered_speed else "running_speed"
+    speed = s[speed_key][0]
+    t_speed = s[speed_key][1]
+
+    fig, (ax_raster, ax_speed) = plt.subplots(
+        2, 1, figsize=figsize, sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]}
+    )
+
+    # Stimulus shading (draw first, so it sits behind the raster/speed lines)
+    add_stimulus_shading(ax_raster, data, session, t, xlim=xlim)
+    add_stimulus_shading(ax_speed, data, session, t, xlim=xlim)
+
+    # --- Top: spike raster ---
+    for cell_idx in range(n_cells):
+        spike_times = t[spikes[cell_idx] > threshold]
+        ax_raster.vlines(spike_times, cell_idx + 0.5, cell_idx + 1.5,
+                         color="black", linewidth=0.5, zorder=2)
+
+    ax_raster.set_ylabel("neuron #")
+    ax_raster.set_ylim(0.5, n_cells + 0.5)
+    ax_raster.set_title(f"session {session}: spike raster ({n_cells} neurons)")
+
+    # --- Bottom: running speed ---
+    ax_speed.plot(t_speed, speed, lw=0.8, color="darkorange", zorder=2)
+    ax_speed.set_xlabel("time (s)")
+    ax_speed.set_ylabel("running speed\n(cm/s)")
+
+    if xlim is not None:
+        ax_raster.set_xlim(xlim)
+        ax_speed.set_xlim(xlim)
+
+    plt.tight_layout()
+    return fig, (ax_raster, ax_speed)
+
+def plot_spike_raster_subset_with_running(data, session, cell_ids, threshold=0.05, xlim=None,
+                                             use_filtered_speed=True, figsize=(12, 6)):
+    """
+    Plot a raster plot for a SUBSET of neurons, with running speed shown
+    below, and blue shading marking stimulus presentation windows.
+
+    Parameters
+    ----------
+    cell_ids : list of int
+        Which neuron indices to plot (e.g. [8, 15, 25, 36]).
+    threshold : float
+        Minimum spike value to count as a "spike event" for raster display.
+    xlim : tuple, optional
+        (start_time, end_time) in seconds to zoom into a specific window.
+    """
+    s = data["sessions"][session]
+    spikes = s["spikes"]
+    t = s["t"]
+
+    speed_key = "running_speed_filtered" if use_filtered_speed else "running_speed"
+    speed = s[speed_key][0]
+    t_speed = s[speed_key][1]
+
+    fig, (ax_raster, ax_speed) = plt.subplots(
+        2, 1, figsize=figsize, sharex=True,
+        gridspec_kw={"height_ratios": [2, 1]}
+    )
+
+    # Stimulus shading (draw first, so it sits behind the raster/speed lines)
+    add_stimulus_shading(ax_raster, data, session, t, xlim=xlim)
+    add_stimulus_shading(ax_speed, data, session, t, xlim=xlim)
+
+    # --- Top: raster for selected neurons only ---
+    for row_idx, cell_idx in enumerate(cell_ids):
+        spike_times = t[spikes[cell_idx] > threshold]
+        ax_raster.vlines(spike_times, row_idx + 0.5, row_idx + 1.5,
+                          color="black", linewidth=0.8, zorder=2)
+
+    ax_raster.set_yticks(np.arange(1, len(cell_ids) + 1))
+    ax_raster.set_yticklabels([f"neuron {c}" for c in cell_ids], fontsize=15)
+    ax_raster.set_ylim(0.5, len(cell_ids) + 0.5)
+    ax_raster.set_title(f"session {session}: spike raster (neurons {cell_ids})", fontsize=15)
+
+    # --- Bottom: running speed ---
+    ax_speed.plot(t_speed, speed, lw=0.8, color="darkorange", zorder=2)
+    ax_speed.set_xlabel("time (s)", fontsize=15)
+    ax_speed.set_ylabel("running speed\n(cm/s)", fontsize=15)
+    ax_speed.tick_params(axis="both", labelsize=15)
+
+
+    if xlim is not None:
+        ax_raster.set_xlim(xlim)
+        ax_speed.set_xlim(xlim)
+
+    plt.tight_layout()
+    return fig, (ax_raster, ax_speed)
+
+def compare_neuron_activity_by_movement(data, session, stim_name, cell_ids,
+                                          phase_key="running_speed_phase"):
+    """
+    For specific neurons, compare spike activity during stimulus presentation
+    trials, split by whether the mouse was moving or stationary during
+    each trial (majority vote based on running_speed_phase).
+
+    Parameters
+    ----------
+    cell_ids : list of int
+        Which neuron indices to analyze (e.g. [25, 36]).
+
+    Returns
+    -------
+    pd.DataFrame with columns: cell, movement_state, sum_spikes, start, end
+    """
+    s = data["sessions"][session]
+    spikes = s["spikes"]
+    phase = s[phase_key]  # 0 = still, 1 = moving, -1 = invalid
+    stim_table = s["stim_tables"][stim_name].copy()
+
+    if "frame" in stim_table.columns:
+        stim_table = stim_table[stim_table["frame"] != -1].reset_index(drop=True)
+
+    rows = []
+    for _, row in stim_table.iterrows():
+        start, end = int(row["start"]), int(row["end"])
+        trial_phase = phase[start:end + 1]
+        trial_phase = trial_phase[trial_phase != -1]
+        if len(trial_phase) == 0:
+            continue
+
+        # Majority vote: is the mouse moving for most of this trial?
+        state = "moving" if np.mean(trial_phase) > 0.5 else "stationary"
+
+        for cell_id in cell_ids:
+            trial_spikes = spikes[cell_id, start:end + 1]
+            rows.append({
+                "cell": cell_id,
+                "movement_state": state,
+                "sum_spikes": np.nansum(trial_spikes),
+                "start": start,
+                "end": end,
+            })
+
+    return pd.DataFrame(rows)
+
+def plot_neuron_activity_by_movement(df, ax=None):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 4))
+
+    sns.boxplot(data=df, x="cell", y="sum_spikes", hue="movement_state", ax=ax,
+                showfliers=False, palette="Set2",
+                showmeans=True,
+                meanprops={"marker": "D", "markerfacecolor": "white",
+                           "markeredgecolor": "black", "markersize": 6})
+
+    ax.set_xlabel("neuron #")
+    ax.set_ylabel("total spike activity per trial")
+    ax.set_title("Neural activity: moving vs. stationary")
+    ax.legend(title="movement state")
+
+    return ax
+
+def compare_neuron_activity_by_movement(data, session, stim_name, cell_ids,
+                                          phase_key="running_speed_phase"):
+    """
+    For specific neurons, compare spike activity during stimulus presentation
+    trials, split by whether the mouse was moving or stationary during
+    each trial (majority vote based on running_speed_phase).
+
+    Parameters
+    ----------
+    cell_ids : list of int
+        Which neuron indices to analyze (e.g. [25, 36]).
+
+    Returns
+    -------
+    pd.DataFrame with columns: cell, movement_state, sum_spikes, start, end
+    """
+    s = data["sessions"][session]
+    spikes = s["spikes"]
+    phase = s[phase_key]  # 0 = still, 1 = moving, -1 = invalid
+    stim_table = s["stim_tables"][stim_name].copy()
+
+    if "frame" in stim_table.columns:
+        stim_table = stim_table[stim_table["frame"] != -1].reset_index(drop=True)
+
+    rows = []
+    for _, row in stim_table.iterrows():
+        start, end = int(row["start"]), int(row["end"])
+        trial_phase = phase[start:end + 1]
+        trial_phase = trial_phase[trial_phase != -1]
+        if len(trial_phase) == 0:
+            continue
+
+        # Majority vote: is the mouse moving for most of this trial?
+        state = "moving" if np.mean(trial_phase) > 0.5 else "stationary"
+
+        for cell_id in cell_ids:
+            trial_spikes = spikes[cell_id, start:end + 1]
+            rows.append({
+                "cell": cell_id,
+                "movement_state": state,
+                "sum_spikes": np.nansum(trial_spikes),
+                "start": start,
+                "end": end,
+            })
+
+    return pd.DataFrame(rows)
+
+def plot_neuron_activity_by_movement(df, ax=None):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 4))
+
+    sns.boxplot(data=df, x="cell", y="sum_spikes", hue="movement_state", ax=ax,
+                showfliers=False, palette="Set2",
+                showmeans=True,
+                meanprops={"marker": "D", "markerfacecolor": "white",
+                           "markeredgecolor": "black", "markersize": 6})
+
+    ax.set_xlabel("neuron #")
+    ax.set_ylabel("total spike activity per trial")
+    ax.set_title("Neural activity: moving vs. stationary")
+    ax.legend(title="movement state")
+
+    return ax
+
+def compare_activity_by_movement_all_stimuli(data, stimulus_session_map=STIMULUS_SESSION_MAP,
+                                                 cell_ids=None, phase_key="running_speed_phase"):
+    """
+    For each stimulus type, compare spike activity between moving and
+    stationary trials, separately for each specified neuron.
+
+    Parameters
+    ----------
+    cell_ids : list of int, optional
+        If specified, compute activity separately for each of these neurons.
+        If None, use all cells combined (population-level sum, labeled as "all_cells").
+
+    Returns
+    -------
+    pd.DataFrame with columns: stimulus, cell, movement_state, sum_spikes
+    """
+    rows = []
+
+    for stim_name, session in stimulus_session_map.items():
+        s = data["sessions"][session]
+        spikes = s["spikes"]
+        phase = s[phase_key]
+        stim_table = s["stim_tables"][stim_name].copy()
+
+        if "frame" in stim_table.columns:
+            stim_table = stim_table[stim_table["frame"] != -1].reset_index(drop=True)
+
+        cells_to_use = cell_ids if cell_ids is not None else [None]  # None = all cells combined
+
+        for _, row in stim_table.iterrows():
+            start, end = int(row["start"]), int(row["end"])
+            trial_phase = phase[start:end + 1]
+            trial_phase = trial_phase[trial_phase != -1]
+            if len(trial_phase) == 0:
+                continue
+
+            state = "moving" if np.mean(trial_phase) > 0.5 else "stationary"
+
+            for cell_id in cells_to_use:
+                if cell_id is None:
+                    trial_activity = np.nansum(spikes[:, start:end + 1])
+                    cell_label = "all_cells"
+                else:
+                    trial_activity = np.nansum(spikes[cell_id, start:end + 1])
+                    cell_label = f"neuron{cell_id}"
+
+                rows.append({
+                    "stimulus": stim_name,
+                    "neuron": cell_label,
+                    "movement_state": state,
+                    "sum_spikes": trial_activity,
+                })
+
+    return pd.DataFrame(rows)
+
+def plot_all_neurons_movement_grid(data, stimulus_session_map=STIMULUS_SESSION_MAP,
+                                       phase_key="running_speed_phase", cols=6):
+    df_all = compare_activity_by_movement_all_stimuli(data, cell_ids=list(range(47)))
+
+    n_cells = 47
+    rows = int(np.ceil(n_cells / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.5, rows * 2.2), sharey=False)
+
+    for i, ax in enumerate(axes.flat):
+        if i >= n_cells:
+            ax.axis("off")
+            continue
+        cell_df = df_all[df_all["neuron"] == f"neuron{i}"]
+        sns.boxplot(data=cell_df, x="stimulus", y="sum_spikes", hue="movement_state",
+                    ax=ax, showfliers=False, palette="Set2", legend=False)
+        ax.set_title(f"neuron {i}", fontsize=8)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        plt.setp(ax.get_xticklabels(), rotation=90, fontsize=6)
+
+    plt.tight_layout()
+    return fig, axes
+
+def plot_activity_by_movement_per_cell(df):
+    g = sns.catplot(
+        data=df, x="stimulus", y="sum_spikes", hue="movement_state",
+        col="neuron", kind="box", showfliers=False, palette="Set2",
+        height=4, aspect=1.1
+    )
+    g.set_xticklabels(rotation=15, ha="right",fontsize=18)
+    g.set_axis_labels("stimulus", "total spike activity per trial", fontsize=20)
+    g.fig.suptitle("Neural activity by movement state", y=1.05, fontsize=20)
+
+    # Set title and tick label sizes for each subplot
+    for ax in g.axes.flat:
+        ax.set_title(ax.get_title(), fontsize=18)
+        ax.tick_params(axis="y", labelsize=18)
+
+    # Increase legend font size
+    if g.legend is not None:
+        g.legend.set_title("movement state", prop={"size": 18})
+        for text in g.legend.get_texts():
+            text.set_fontsize(18)
+    return g
+
+def get_running_speed_by_stimulus(data, stimulus_session_map=STIMULUS_SESSION_MAP, filtered=True):
+    """
+    Extract running speed values during each stimulus's presentation trials.
+    Uses the filtered (smoothed, clipped) speed trace by default.
+    """
+    stimulus_speed = {}
+
+    for stim_name, session in stimulus_session_map.items():
+        s = data["sessions"][session]
+        key = "running_speed_filtered" if filtered else "running_speed"
+        speed = s[key][0]
+        stim_table = s["stim_tables"][stim_name]
+
+        starts = stim_table["start"].astype(int).values
+        ends = stim_table["end"].astype(int).values
+
+        speed_values = [speed[start:end + 1] for start, end in zip(starts, ends)]
+        stimulus_speed[stim_name] = np.concatenate(speed_values) if speed_values else np.array([])
+
+    return stimulus_speed
+
+
+def plot_speed_by_stimulus(stimulus_speed, ax=None):
+    """
+    Plot running speed distributions across the four stimulus types as boxplots,
+    with mean values shown as markers and text labels.
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4))
+
+    rows = []
+    for stim_name, speeds in stimulus_speed.items():
+        for v in speeds:
+            rows.append({"stimulus": stim_name, "speed": v})
+    df_long = pd.DataFrame(rows)
+
+    sns.boxplot(data=df_long, x="stimulus", y="speed", ax=ax,
+                showfliers=False, width=0.5, palette="Set2",
+                showmeans=True,
+                meanprops={"marker": "D", "markerfacecolor": "white",
+                           "markeredgecolor": "black", "markersize": 7})
+
+    # Annotate each box with its mean value as text
+    stim_order = list(stimulus_speed.keys())
+    for i, stim_name in enumerate(stim_order):
+        mean_val = np.mean(stimulus_speed[stim_name])
+        ax.text(i, mean_val, f"{mean_val:.2f}", ha="center", va="bottom",
+                fontsize=9, fontweight="bold", color="black")
+
+    ax.set_xlabel("stimulus")
+    ax.set_ylabel("running speed (cm/s)")
+    ax.set_title("Running speed across stimulus types")
+    plt.setp(ax.get_xticklabels(), rotation=15, ha="right")
+
+    return ax
+
+def show_all_natural_scenes(data, ncols=12):
+    '''this function could show all the natural stimulation
+    118 in total'''
+    tmpl = data["templates"]["natural_scenes"]
+    n = tmpl.shape[0]                          # Total 118 frame
+    nrows = int(np.ceil(n / ncols))
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(ncols * 1.5, nrows * 1.5),
+        constrained_layout=True,
+    )
+    axes = axes.flat
+
+    for i, ax in enumerate(axes):
+        if i < n:
+            ax.imshow(tmpl[i], cmap="gray")
+            ax.set_title(str(i), fontsize=6)
+        ax.axis("off")
+
+
+
+
 #----------------------------- Running speed - neural activity analysis utils #-----------------------------
+
+def get_speed_per_trial(data, session, stim_name, frame_to_category, filtered=True):
+    """
+    For each stimulus presentation trial, extract the mean running speed
+    during that trial, and tag it with its frame number and category.
+
+    Returns
+    -------
+    pd.DataFrame with columns: frame, category, mean_speed, start, end
+    """
+    # Categorized the pictures into aversive and neutral
+    aversive_frames = [
+        0, 1, 2,  # bears
+        4,  # Bird
+        6, 7,  # lions
+        8, 9,  # elephant
+        10, 11, 12,  # tigers close-up
+        13, 14,  # coyote howling
+        15, 16,  # cheetah
+        17,  # leopard
+        18,  # eagle
+        19,  # birds fighting
+        21,  # bird
+        22,  # leopard/jaguar close-up
+        23,  # monkey
+        25,  # Otter
+        27,  # tiger
+        28,  # bird
+        29,  # coyotes
+        34,  # elephants
+        35,  # bird
+        39,  # leopard camouflaged
+        47,  # bobcat
+        49,  # bird
+        50,  # wolf/coyote
+        51, 52,  # bird
+        55, 56,  # hawk flying
+        58,  # owl
+        102,  # bird
+    ]
+
+    frame_to_category = {i: "aversive" for i in aversive_frames}
+    for i in range(118):
+        if i not in frame_to_category:
+            frame_to_category[i] = "neutral"
+    s = data["sessions"][session]
+    key = "running_speed_filtered" if filtered else "running_speed"
+    speed = s[key][0]
+    stim_table = s["stim_tables"][stim_name].copy()
+
+    # Exclude blank sweeps (frame == -1, no image shown)
+    stim_table = stim_table[stim_table["frame"] != -1].reset_index(drop=True)
+
+    mean_speeds = []
+    for _, row in stim_table.iterrows():
+        start, end = int(row["start"]), int(row["end"])
+        trial_speed = speed[start:end + 1]
+        mean_speeds.append(np.nanmean(trial_speed))
+
+    stim_table["mean_speed"] = mean_speeds
+    stim_table["category"] = stim_table["frame"].map(frame_to_category)
+
+    return stim_table
+
+def plot_speed_by_category(trial_df, ax=None):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5, 4))
+
+    sns.boxplot(data=trial_df, x="category", y="mean_speed", ax=ax,
+                showfliers=False, width=0.5, palette="Set2",
+                showmeans=True,
+                meanprops={"marker": "D", "markerfacecolor": "white",
+                           "markeredgecolor": "black", "markersize": 7})
+
+    ax.set_xlabel("image category")
+    ax.set_ylabel("mean running speed per trial (cm/s)")
+    ax.set_title("Running speed by image category (aversive vs neutral, session B)")
+
+    return ax
+
+def get_neural_activity_per_trial(data, session, stim_name, frame_to_category):
+    """
+    For each stimulus presentation trial, extract the total (summed) spike activity
+    during that trial, and tag it with its frame number and category.
+
+    Returns
+    -------
+    pd.DataFrame with columns: frame, category, sum_spikes, start, end
+    """
+    s = data["sessions"][session]
+    spikes = s["spikes"]  # shape (n_cells, n_timepoints)
+    stim_table = s["stim_tables"][stim_name].copy()
+
+    # Exclude blank sweeps (frame == -1, no image shown)
+    stim_table = stim_table[stim_table["frame"] != -1].reset_index(drop=True)
+
+    sum_spikes = []
+    for _, row in stim_table.iterrows():
+        start, end = int(row["start"]), int(row["end"])
+        trial_spikes = spikes[:, start:end + 1]
+        sum_spikes.append(np.nansum(trial_spikes))
+
+    stim_table["sum_spikes"] = sum_spikes
+    stim_table["category"] = stim_table["frame"].map(frame_to_category)
+
+    return stim_table
+
+def get_neural_activity_by_stimulus(data, stimulus_session_map=STIMULUS_SESSION_MAP):
+    """
+    Extract total (summed) spike activity during each stimulus's presentation trials,
+    across all four stimulus types (spanning sessions A, B, C).
+
+    Returns
+    -------
+    dict: {stimulus_name: np.ndarray of per-trial summed spike values}
+    """
+    stimulus_activity = {}
+
+    for stim_name, session in stimulus_session_map.items():
+        s = data["sessions"][session]
+        spikes = s["spikes"]
+        stim_table = s["stim_tables"][stim_name]
+
+        starts = stim_table["start"].astype(int).values
+        ends = stim_table["end"].astype(int).values
+
+        trial_sums = [np.nansum(spikes[:, start:end + 1]) for start, end in zip(starts, ends)]
+        stimulus_activity[stim_name] = np.array(trial_sums)
+
+    return stimulus_activity
+
+def plot_activity_by_stimulus(stimulus_activity, ax=None):
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 4))
+
+    rows = []
+    for stim_name, values in stimulus_activity.items():
+        for v in values:
+            rows.append({"stimulus": stim_name, "sum_spikes": v})
+    df_long = pd.DataFrame(rows)
+
+    sns.boxplot(data=df_long, x="stimulus", y="sum_spikes", ax=ax,
+                showfliers=False, width=0.5, palette="Set2",
+                showmeans=True,
+                meanprops={"marker": "D", "markerfacecolor": "white",
+                           "markeredgecolor": "black", "markersize": 7})
+
+    stim_order = list(stimulus_activity.keys())
+    for i, stim_name in enumerate(stim_order):
+        mean_val = np.mean(stimulus_activity[stim_name])
+        ax.text(i, mean_val, f"{mean_val:.3f}", ha="center", va="bottom",
+                fontsize=9, fontweight="bold", color="black")
+
+    ax.set_xlabel("stimulus")
+    ax.set_ylabel("total population spike activity per trial")
+    ax.set_title("Neural activity across stimulus types")
+    plt.setp(ax.get_xticklabels(), rotation=15, ha="right")
+
+    return ax
 
 # Select only phases without stimulus to avoid mixing up stimulus and running speed influence
 def spontaneous_mask(session):
@@ -373,6 +1186,87 @@ def vonMises(θ: np.ndarray, α: float, κ: float, ν: float, ϕ: float) -> np.n
     # transform into degree
     θ = np.deg2rad(θ)
     return np.exp(α + κ * (np.cos(2 * (θ - ϕ)) - 1) + ν * (np.cos(θ - ϕ) - 1))
+
+
+def fit_tuning_curves(
+        data,
+        session="B",
+        stimulus="drifting_gratings",
+        parameter="orientation",
+        speed_phase=None,
+):
+    """Compute per-trial spike counts and fit a von Mises tuning curve per cell,
+    in one pass over the stimulus table.
+    Also allows filtering trials based on running speed phase (e.g., still vs running).
+    """
+    session_data = data["sessions"][session]
+    spikes = np.asarray(session_data["spikes"], dtype=float)
+    stim_table = session_data["stim_tables"][stimulus]
+    running_speed_phase = session_data["running_speed_phase"]
+
+    n_cells = spikes.shape[0]
+    # Hold spike counts and stimulus values for each cell
+    counts_per_cell = [[] for _ in range(n_cells)]
+    stim_per_cell = [[] for _ in range(n_cells)]
+
+    for _, trial in stim_table.iterrows():
+        start_idx = int(trial["start"])
+        stop_idx = int(trial["end"])
+        stim_value = trial[parameter]
+
+        if speed_phase is not None:
+            samples_in_phase = running_speed_phase[start_idx:stop_idx] == speed_phase
+            if not np.any(samples_in_phase):
+                continue
+            # Count spikes only in the samples that match the specified speed phase
+            spike_count = np.sum(spikes[:, start_idx:stop_idx][:, samples_in_phase], axis=1)
+        else:
+            spike_count = np.sum(spikes[:, start_idx:stop_idx], axis=1)
+
+        # Store spike counts and stimulus values for each cell
+        for cell_idx in range(n_cells):
+            counts_per_cell[cell_idx].append(spike_count[cell_idx])
+            stim_per_cell[cell_idx].append(stim_value)
+
+    # Fit tuning curves for each cell
+    fitted_params = []
+    for cell_idx in range(n_cells):
+        counts = np.asarray(counts_per_cell[cell_idx], dtype=float)  # shape (n_trials,)
+        stim = np.asarray(stim_per_cell[cell_idx], dtype=float)  # shape (n_trials,)
+
+        # Remove NaN or infinite values
+        valid = np.isfinite(counts) & np.isfinite(stim)
+        counts = counts[valid]
+        stim = stim[valid]
+
+        params = tuningCurve(counts, stim)
+        fitted_params.append(
+            {
+                "cell": cell_idx,
+                "stimulus_parameters": stim,
+                "spike_counts": counts,
+                "van-mises-params": params,
+                "speed_phase": speed_phase
+            }
+        )
+
+    return fitted_params
+
+def compute_tuning_significance(fitted_params, psi=2, niters=1000, random_seed=2046):
+    """Permutation-based tuning significance per cell.
+    """
+    p_values = {}
+    for entry in fitted_params:
+        cell = int(entry["cell"])
+        stim = np.asarray(entry["stimulus_parameters"], dtype=float)
+        counts = np.asarray(entry["spike_counts"], dtype=float)
+
+        p_value, q_abs, _ = testTuning(
+            counts, stim, psi=psi, niters=niters, random_seed=random_seed
+        )
+        p_values[cell] = p_value
+
+    return p_values
 
 def tuningCurve(
     counts: np.ndarray, 
